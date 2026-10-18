@@ -60,3 +60,7 @@ lovec . --bench 10     # frame timing at 1080p
 ## Credits
 
 The `libs/LoveLibs` directory is a subtree of [LoveLibs](https://github.com/chrischaps/LoveLibs), which provides scaling, post-processing, music, a debug overlay and verlet vines.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
