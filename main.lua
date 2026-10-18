@@ -1,282 +1,397 @@
--- Procedural Character Animation Explorer
--- Controls:
---   Left Click: Set destination (creature pathfinds to location)
---   Tab: Switch between creatures
---   D: Toggle debug visualization
---   N: Toggle nav graph visualization
---   S: Toggle smooth rendering (for worm)
---   R: Reset creature position
+-- Character v2: The Dusk Cave
+-- Procedural creatures living in an overgrown cave at dusk.
+-- Click to guide the selected creature; the others wander on their own.
+-- Press H in-game for controls; see dev.lua for headless verification modes.
 
-local vec2 = require('lib.vec2')
-local Level = require('world.level')
-local NavGraph = require('core.navgraph')
-local Pathfinder = require('core.pathfinder')
-local Controller = require('core.controller')
+love.filesystem.setRequirePath("libs/?.lua;libs/?/init.lua;" .. love.filesystem.getRequirePath())
+
+local scaling = require('LoveLibs.graphics.scaling')
+local PostFX = require('LoveLibs.graphics.postfx')
+local music = require('LoveLibs.audio.music')
+local overlay = require('LoveLibs.core.debug')
+
+local dev = require('dev')
+local log = require('core.log')
+local rng = require('core.rng')
 local Synth = require('core.synth')
+local World = require('world.world')
+local Scene = require('world.render.scene')
+local Hud = require('ui.hud')
+local cave = require('world.levels.cave')
 
--- Available creatures
-local creature_classes = {
-    require('creatures.worm'),
-    require('creatures.blob'),
-}
+local VW, VH = cave.width, cave.height
+local FIXED_DT = 1 / 120
 
--- State
-local creature
-local current_creature_index = 1
-local level
-local navgraph
-local pathfinder
-local controller
-local synth
+local args = dev.parse(arg or {})
+local world, scene, hud, synth
+local acc = 0
+local paused = false
+local snap_frames = nil
+local snap_shot = nil
+local bench = nil
+local render_scale = 0
+local capture = nil      -- --script mode: {co = coroutine, last = canvas}
+local script_api        -- defined below love.load; forward-declared so load can see it
 
-local debug_mode = false
-local show_navgraph = false
-local smooth_mode = false
-local gravity = vec2.new(0, 980)
-
--- Virtual resolution for scaling
-local VIRTUAL_WIDTH = 800
-local VIRTUAL_HEIGHT = 600
-local scale = 1
-local offset_x = 0
-local offset_y = 0
-local canvas
-
--- Calculate scale to fit virtual resolution in window (letterboxed)
-local function update_scale()
-    local window_width, window_height = love.graphics.getDimensions()
-
-    -- Calculate scale to fit while maintaining aspect ratio
-    local scale_x = window_width / VIRTUAL_WIDTH
-    local scale_y = window_height / VIRTUAL_HEIGHT
-    scale = math.min(scale_x, scale_y)
-
-    -- Center the scaled canvas (letterboxing)
-    offset_x = (window_width - VIRTUAL_WIDTH * scale) / 2
-    offset_y = (window_height - VIRTUAL_HEIGHT * scale) / 2
+-- Fit the virtual cave into a w x h target (letterboxed), optionally zoomed
+-- around a virtual point: zoom = {x, y, z}
+local function view(w, h, zoom)
+    w, h = w or love.graphics.getWidth(), h or love.graphics.getHeight()
+    local s = math.min(w / VW, h / VH)
+    local ox, oy = (w - VW * s) / 2, (h - VH * s) / 2
+    zoom = zoom or args.zoom
+    if zoom then
+        s = s * (zoom.z or 2)
+        ox = w / 2 - zoom.x * s
+        oy = h / 2 - zoom.y * s
+    end
+    return s, ox, oy
 end
 
--- Convert screen coordinates to virtual coordinates
-local function screen_to_virtual(x, y)
-    local vx = (x - offset_x) / scale
-    local vy = (y - offset_y) / scale
-    return vx, vy
+-- Static layers are baked at render resolution (capped: past 4x the extra
+-- pixels cost memory without adding anything you can see)
+local function rebake(s)
+    s = math.min(s, 4)
+    if math.abs(s - render_scale) > 1e-3 then
+        render_scale = s
+        scene:bake(s)
+    end
+end
+
+-- Draw one whole frame (scene, post effects, HUD) into the current target.
+-- opts: zoom, hud (default true), alpha
+local function draw_frame(w, h, opts)
+    opts = opts or {}
+    local s, ox, oy = view(w, h, opts.zoom)
+    rebake(s)
+    local time = world.time
+
+    PostFX.beginScene()
+    love.graphics.clear(0.03, 0.025, 0.05, 1)
+    love.graphics.push()
+    local sx, sy = scene:shake_offset(time)
+    love.graphics.translate(ox + sx * s, oy + sy * s)
+    love.graphics.scale(s)
+    if not opts.zoom then love.graphics.setScissor(ox, oy, VW * s, VH * s) end
+    scene:draw(time, opts.alpha or 1)
+    love.graphics.setScissor()
+    love.graphics.pop()
+    -- PostFX draws its canvases with the current colour: make sure it's white
+    love.graphics.setColor(1, 1, 1, 1)
+    PostFX.endScene(1, 0, 0)
+
+    if opts.hud ~= false then
+        hud.paused, hud.muted = paused, synth.muted
+        hud:draw(world, function(x, y) return ox + x * s, oy + y * s end, s)
+    end
+end
+
+local function select_creature(i)
+    if i == world.selected or not world.creatures[i] then return end
+    world:select(i)
+    hud:announce()
+    local x = world:selected_creature():anchor()
+    synth:chime(i + 1, x)
 end
 
 function love.load()
-    love.graphics.setBackgroundColor(0.1, 0.1, 0.12)  -- Letterbox color
+    rng.seed(args.seed or 7)
+    if args.selftest then
+        love.event.quit(dev.selftest(World, cave, FIXED_DT) and 0 or 1)
+        return
+    end
+    if args.navdump then
+        dev.navdump(World, cave, args.navdump.who, args.navdump.solid)
+        love.event.quit()
+        return
+    end
 
-    -- Create canvas for virtual resolution
-    canvas = love.graphics.newCanvas(VIRTUAL_WIDTH, VIRTUAL_HEIGHT)
-    canvas:setFilter("linear", "linear")  -- Smooth scaling
+    love.graphics.setDefaultFilter('linear', 'linear')
+    scaling.init(VW, VH)
+    PostFX.init(love.graphics.getWidth(), love.graphics.getHeight(), {
+        distortion = {enabled = false},
+        bloom = {enabled = true, threshold = 0.7, softness = 0.18, intensity = 0.5, radius = 3.2},
+        colorGrade = {
+            enabled = true, saturation = 0.08, contrast = 0.07, warmth = 0.02,
+            vignetteStrength = 0.3, vignetteRadius = 0.78,
+            shadowTint = {0.12, 0.05, 0.24}, highlightTint = {1.0, 0.95, 0.88},
+        },
+    })
 
-    update_scale()
-
-    -- Create level at virtual resolution
-    level = Level.new()
-    level:create_test_level(VIRTUAL_WIDTH, VIRTUAL_HEIGHT)
-
-    -- Build navigation graph
-    navgraph = NavGraph.new()
-    navgraph:build_from_level(level)
-
-    -- Create pathfinder
-    pathfinder = Pathfinder.new(navgraph)
-
-    -- Create controller
-    controller = Controller.new(pathfinder)
-
-    -- Create sound system
+    world = World.new(cave, {wander = not args.nowander})
+    scene = Scene.new(world)
+    hud = Hud.new()
     synth = Synth.new()
+    world.events:on(function(ev) synth:on_event(ev, world:selected_creature()) end)
+    rebake(view())
 
-    -- Spawn creature
-    spawn_creature()
+    overlay.addGlobalInfo("sim time", function() return world.time end)
+    function world:getDebugInfo()
+        local c = self:selected_creature()
+        local ctrl = self.controllers[self.selected]
+        local step = ctrl.path and ctrl.path[ctrl.i]
+        local x, y = c:anchor()
+        return {
+            {section = c:get_name()},
+            {key = "anchor", value = string.format("%.0f, %.0f", x, y)},
+            {key = "state", value = c.mode or c.mover.state},
+            {key = "support", value = (c.solid or c.mover.solid or {}).id or "-"},
+            {section = "Navigation"},
+            {key = "graph", value = #self.graphs[self.selected].nodes .. " nodes"},
+            {key = "step", value = step and (ctrl.i .. "/" .. #ctrl.path .. " " .. (step.edge and step.edge.kind or "walk")) or "idle"},
+            {key = "repaths", value = tostring(ctrl.repaths)},
+        }
+    end
+
+    if args.snap then
+        synth.muted = true
+        for i, def in ipairs(World.CREATURES) do
+            if def.key == args.snap.who then world:select(i) end
+        end
+        if args.goal then
+            local node, ok = world:click(args.goal.x, args.goal.y)
+            scene:set_goal(node, ok)
+        end
+        scene.debug = args.debug
+        scene.show_nav = args.nav
+        scene.nolight = args.nolight
+        PostFX.bypass = args.nopost or false
+        local steps = math.floor((args.snap.seconds or 1) / FIXED_DT)
+        for s = 1, steps do
+            world:snapshot()
+            world:step(FIXED_DT)
+            scene:update(FIXED_DT)
+        end
+        hud.title_t = 1
+        hud.hint = 0
+        hud.help = args.help
+        if args.debug then overlay.show() end
+        snap_frames = 0
+    elseif not args.script then
+        music.play('calm')
+        music.setVolume(0.55)
+    end
+    if args.script then
+        synth.muted = true
+        local chunk, err = love.filesystem.load(args.script)
+        if not chunk then error(err) end
+        local script = chunk()
+        local api = script_api()
+        capture = {co = coroutine.create(function() script.run(api) end)}
+    end
+    if args.bench then
+        love.window.setVSync(0)
+        love.window.setMode(1920, 1080, {vsync = 0, resizable = true, msaa = 4})
+        scaling.resize(1920, 1080)
+        PostFX.resize(1920, 1080)
+        synth.muted = true
+        music.setVolume(0)
+        bench = {t = 0, frames = 0, worst = 0}
+    end
 end
 
-function spawn_creature()
-    local class = creature_classes[current_creature_index]
-    -- Spawn at x=150 to avoid the left tower (which spans x=50 to x=110)
-    -- Spawn AT ground level (accounting for creature's visual size)
-    creature = class.new(150, level.ground_y - 5)
-    creature.is_grounded = true
-    creature.synth = synth  -- Attach sound system
-    if creature.chain then
-        creature.chain:get_head().pinned = true
+-- The API a --script capture file drives. Rendering is offscreen at any size,
+-- and time only moves when the script steps it, so captures are exact.
+function script_api()
+    local api = {world = world, scene = scene, hud = hud, PostFX = PostFX, FIXED_DT = FIXED_DT, VW = VW, VH = VH}
+    local canvases = {}
+    local post_size = {0, 0}
+
+    -- Advance the simulation (and everything that animates) by `seconds`
+    function api.step(seconds)
+        local n = math.max(1, math.floor(seconds / FIXED_DT + 0.5))
+        for _ = 1, n do
+            world:snapshot()
+            world:step(FIXED_DT)
+        end
+        scene:update(n * FIXED_DT)
+        hud:update(n * FIXED_DT)
     end
-    controller:clear_path()
-    -- Stop any playing sounds when switching creatures
-    if synth then
-        synth:stop_slide()
+
+    -- Render a full frame into a w x h canvas and return it.
+    -- opts: zoom = {x, y, z}, hud = bool, plus scene flags (xray, show_nav, debug, nolight, hide_marker)
+    function api.render(w, h, opts)
+        opts = opts or {}
+        local key = w .. 'x' .. h
+        local target = canvases[key]
+        if not target then
+            target = love.graphics.newCanvas(w, h)
+            canvases[key] = target
+        end
+        if post_size[1] ~= w or post_size[2] ~= h then
+            PostFX.resize(w, h)
+            post_size[1], post_size[2] = w, h
+        end
+        local flags = {'xray', 'show_nav', 'debug', 'nolight', 'hide_marker'}
+        local saved = {}
+        for i, k in ipairs(flags) do
+            saved[i] = scene[k]
+            if opts[k] ~= nil then scene[k] = opts[k] end
+        end
+        -- PostFX ends by drawing "to the screen" (setCanvas()); send that to our target
+        local set = love.graphics.setCanvas
+        love.graphics.setCanvas = function(...)
+            if select('#', ...) == 0 or (...) == nil then return set(target) end
+            return set(...)
+        end
+        set(target)
+        love.graphics.clear(0, 0, 0, 1)
+        local ok, err = pcall(draw_frame, w, h, {zoom = opts.zoom, hud = opts.hud == true, alpha = 1})
+        love.graphics.setCanvas = set
+        set()
+        for i, k in ipairs(flags) do scene[k] = saved[i] end  -- nil-safe restore
+        if not ok then error(err, 0) end
+        capture.last = target
+        return target
     end
-    print("[SPAWN] Creature spawned at y=" .. (level.ground_y - 5) .. ", ground_y=" .. level.ground_y)
+
+    -- Save a canvas as PNG in the save directory
+    function api.save(canvas, file)
+        canvas:newImageData():encode('png', file)
+        log.info('dev', 'saved %s/%s', love.filesystem.getSaveDirectory(), file)
+    end
+
+    function api.click(x, y)
+        local node, ok = world:click(x, y)
+        if node and ok then scene:set_goal(node, ok) end
+        return node, ok
+    end
+
+    function api.select(i) world:select(i) end
+    function api.yield() coroutine.yield() end
+    api.log = function(...) log.info('dev', ...) end
+    return api
 end
 
 function love.update(dt)
-    dt = math.min(dt, 1/30)
-
-    local cx, cy = creature:get_position()
-    local reached = false
-
-    -- Get movement target from controller
-    local target, action
-    target, action, reached = controller:get_movement_target(cx, cy, dt)
-
-    if target and not reached then
-        -- Calculate movement
-        local movement = controller:calculate_movement(
-            vec2.new(cx, cy),
-            target,
-            action,
-            creature.is_grounded,
-            dt
-        )
-
-        -- Log movement type periodically
-        if love.timer.getTime() % 1 < dt then
-            print("[MAIN] action=" .. tostring(action) .. ", movement.type=" .. tostring(movement.type) .. ", is_grounded=" .. tostring(creature.is_grounded))
+    if not world then return end
+    if capture then
+        local ok, err = coroutine.resume(capture.co)
+        if not ok then
+            print('[script] ' .. tostring(err))
+            print(debug.traceback(capture.co))
+            love.event.quit(1)
+        elseif coroutine.status(capture.co) == 'dead' then
+            love.event.quit(0)
         end
-
-        -- Apply movement to creature
-        creature:apply_movement(movement, dt)
+        return
     end
-
-    -- Update creature physics
-    creature:update(dt, nil, gravity, level)
-
-    -- Update sound system (handles fading)
-    synth:update(dt)
-
-    -- Stop slide sound when creature is idle (reached destination or no path)
-    if not controller:has_path() or reached then
-        synth:stop_slide()
+    if snap_frames then return end
+    if bench then
+        bench.t, bench.frames = bench.t + dt, bench.frames + 1
+        if bench.t > 1 then bench.worst = math.max(bench.worst, dt) end
+        if bench.t > 1 and bench.frames % 240 == 0 then
+            -- keep everyone busy: send the selected creature somewhere new
+            select_creature(bench.frames / 240 % 3 + 1)
+            local g = world.graphs[world.selected]
+            world.controllers[world.selected]:go_to(g:random_node(rng.look))
+        end
+        if bench.t > args.bench then
+            log.info('dev', '%d frames in %.1fs: avg %.2f ms (%.0f fps), worst %.2f ms, mem %.1f MB',
+                bench.frames, bench.t, bench.t / bench.frames * 1000, bench.frames / bench.t,
+                bench.worst * 1000, collectgarbage('count') / 1024)
+            love.event.quit()
+        end
     end
+    dt = math.min(dt, 0.1)
+
+    if not paused then
+        acc = acc + dt
+        while acc >= FIXED_DT do
+            world:snapshot()
+            world:step(FIXED_DT)
+            acc = acc - FIXED_DT
+        end
+        scene:update(dt)
+    end
+    hud:update(dt)
+    synth:update(dt, world)
+    music.update(dt)
+    PostFX.update(dt)
 end
 
 function love.draw()
-    -- Render everything to the canvas at virtual resolution
-    love.graphics.setCanvas(canvas)
-    love.graphics.clear(0.15, 0.15, 0.2)
-
-    -- Draw level
-    if debug_mode or show_navgraph then
-        level:draw_debug()
-    else
-        level:draw()
-    end
-
-    -- Draw nav graph
-    if show_navgraph then
-        navgraph:draw_debug()
-    end
-
-    -- Draw path
-    if debug_mode and controller:has_path() then
-        local cx, cy = creature:get_position()
-        controller:draw_debug(cx, cy)
-    end
-
-    -- Draw creature
-    if debug_mode then
-        creature:draw_debug()
-    end
-
-    if smooth_mode and creature.draw_smooth then
-        creature:draw_smooth()
-    else
-        creature:draw()
-    end
-
-    -- Draw click indicator
-    if controller.target then
-        love.graphics.setColor(1, 0.3, 0.3, 0.8)
-        love.graphics.circle('line', controller.target.x, controller.target.y, 12)
-        love.graphics.circle('line', controller.target.x, controller.target.y, 6)
-    end
-
-    -- Draw UI
-    draw_ui()
-
-    -- Switch back to screen and draw scaled canvas
-    love.graphics.setCanvas()
-    love.graphics.setColor(1, 1, 1)
-    love.graphics.draw(canvas, offset_x, offset_y, 0, scale, scale)
-end
-
-function draw_ui()
-    love.graphics.setColor(1, 1, 1, 0.8)
-
-    local y = 10
-    love.graphics.print("Creature: " .. creature:get_name(), 10, y)
-    y = y + 20
-    love.graphics.print(creature:get_description(), 10, y)
-
-    y = y + 30
-    love.graphics.setColor(0.7, 0.7, 0.7, 0.8)
-    love.graphics.print("Controls:", 10, y)
-    y = y + 18
-    love.graphics.print("  Left Click - Set destination", 10, y)
-    y = y + 15
-    love.graphics.print("  Tab - Switch creature (" .. current_creature_index .. "/" .. #creature_classes .. ")", 10, y)
-    y = y + 15
-    love.graphics.print("  D - Debug: " .. (debug_mode and "ON" or "OFF"), 10, y)
-    y = y + 15
-    love.graphics.print("  N - Nav graph: " .. (show_navgraph and "ON" or "OFF"), 10, y)
-    y = y + 15
-    love.graphics.print("  S - Smooth: " .. (smooth_mode and "ON" or "OFF"), 10, y)
-    y = y + 15
-    love.graphics.print("  R - Reset", 10, y)
-
-    -- Path info
-    if controller:has_path() then
-        y = y + 20
-        love.graphics.setColor(0.5, 1, 0.5, 0.8)
-        love.graphics.print("Path: waypoint " .. controller.current_waypoint .. "/" .. #controller.path, 10, y)
-    end
-
-    -- FPS (use virtual width)
-    love.graphics.setColor(0.5, 0.5, 0.5)
-    love.graphics.print("FPS: " .. love.timer.getFPS(), VIRTUAL_WIDTH - 70, 10)
-end
-
-function love.mousepressed(x, y, button)
-    if button == 1 then
-        -- Convert screen coordinates to virtual coordinates
-        local vx, vy = screen_to_virtual(x, y)
-
-        -- Clamp to virtual bounds
-        vx = math.max(0, math.min(VIRTUAL_WIDTH, vx))
-        vy = math.max(0, math.min(VIRTUAL_HEIGHT, vy))
-
-        -- Left click: set destination
-        local cx, cy = creature:get_position()
-        local success = controller:set_destination(vx, vy, cx, cy)
-
-        if not success then
-            -- No path found, flash or something
-            print("No path to destination")
+    if not world then return end
+    if capture then
+        -- Show the last captured frame while a script runs
+        if capture.last then
+            local cw, ch = capture.last:getDimensions()
+            local k = math.min(love.graphics.getWidth() / cw, love.graphics.getHeight() / ch)
+            love.graphics.setColor(1, 1, 1)
+            love.graphics.draw(capture.last, 0, 0, 0, k, k)
         end
+        return
     end
-end
+    draw_frame(nil, nil, {alpha = snap_frames and 1 or (acc / FIXED_DT)})
+    overlay.draw(world)
 
-function love.keypressed(key)
-    if key == 'tab' then
-        current_creature_index = (current_creature_index % #creature_classes) + 1
-        spawn_creature()
-    elseif key == 'd' then
-        debug_mode = not debug_mode
-    elseif key == 'n' then
-        show_navgraph = not show_navgraph
-    elseif key == 's' then
-        smooth_mode = not smooth_mode
-    elseif key == 'r' then
-        creature:reset(150, level.ground_y - 5)
-        controller:clear_path()
-    elseif key == 'escape' then
-        love.event.quit()
+    if snap_frames then
+        snap_frames = snap_frames + 1
+        local fr = args.frames or {n = 1, every = 0}
+        local file = args.snap.file or 'snap.png'
+        if fr.n > 1 then file = file:gsub('%.png$', '') .. '_' .. (snap_shot or 1) .. '.png' end
+        if snap_frames == 2 then
+            love.graphics.captureScreenshot(file)
+        elseif snap_frames > 3 then
+            log.info('dev', 'saved %s/%s', love.filesystem.getSaveDirectory(), file)
+            snap_shot = (snap_shot or 1) + 1
+            if snap_shot > fr.n then
+                love.event.quit()
+            else
+                for _ = 1, math.floor(fr.every / FIXED_DT) do
+                    world:snapshot()
+                    world:step(FIXED_DT)
+                    scene:update(FIXED_DT)
+                end
+                snap_frames = 0
+            end
+        end
     end
 end
 
 function love.resize(w, h)
-    -- Just update the scale - level stays at virtual resolution
-    update_scale()
+    scaling.resize(w, h)
+    PostFX.resize(w, h)
+end
+
+function love.mousepressed(x, y, button)
+    if not world or snap_frames or button ~= 1 then return end
+    local vx, vy = scaling.toVirtual(x, y)
+    if vx < 0 or vy < 0 or vx > VW or vy > VH then return end
+    local node, ok = world:click(vx, vy)
+    hud:clicked()
+    if node and ok then
+        scene:set_goal(node, ok)
+        synth:chime(1 + (math.floor(node.x / 120) % 5), node.x)
+    else
+        scene.marker:reject(vx, vy)
+        synth:nope(vx)
+    end
+end
+
+function love.keypressed(key)
+    if not world then return end
+    if key == 'escape' then love.event.quit()
+    elseif key == 'tab' then select_creature(world.selected % #world.creatures + 1)
+    elseif key == '1' or key == '2' or key == '3' then select_creature(tonumber(key))
+    elseif key == 'h' then hud.help = not hud.help
+    elseif key == 'n' then scene.show_nav = not scene.show_nav
+    elseif key == 'x' then scene.xray = not scene.xray
+    elseif key == 'd' then
+        scene.debug = not scene.debug
+        log.enabled = scene.debug
+        overlay.toggle()
+    elseif key == 'w' then world.wander = not world.wander
+    elseif key == 'p' then paused = not paused
+    elseif key == 'm' then
+        synth.muted = not synth.muted
+        music.setVolume(synth.muted and 0 or 0.55)
+    elseif key == 'r' then
+        world:reset()
+        scene.marker:clear()
+    elseif key == 'f' then
+        love.window.setFullscreen(not love.window.getFullscreen(), 'desktop')
+    else
+        PostFX.handleKeyPress(key)
+    end
 end

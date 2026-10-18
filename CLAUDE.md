@@ -1,14 +1,16 @@
-# Procedural Character Animation - LÖVE 2D
+# Character v2: The Dusk Cave (LÖVE 2D)
 
-A project exploring programmatic/procedural 2D character animation inspired by Rain World's physics-based creature movement.
+Procedural creature animation in the spirit of Rain World. Three creatures live in one overgrown cave at dusk. You guide one with clicks, and the other two wander on their own. Each creature shows a different technique:
 
-## Project Overview
+| Creature | Technique |
+|----------|-----------|
+| **Earthworm** (`creatures/worm.lua`) | A verlet chain that crawls by peristalsis. It has bending stiffness, ground grip, and a tapered mesh. |
+| **Jelly Blob** (`creatures/blob.lua`) | A position-based pressure soft body. It uses edge and area constraints, rolls, and squashes for real when it lands. |
+| **Cave Spider** (`creatures/spider.lua`) | Eight FABRIK legs that step to raycast footholds in alternating groups. It walks on floors, walls and ceilings. |
 
-This project implements multiple approaches to procedural character animation:
-1. **Verlet Chain (Worm)** - Segmented body with distance constraints
-2. **Spring-Damper (Blob)** - Soft body with spring physics
+![v2](docs/v2-dusk-cave.png)
 
-Both creatures can autonomously pathfind and navigate a platformer level using A* pathfinding.
+v1 (tag `v1`) was two creatures on grey platforms. See git history for the v2 rebuild plan's rationale.
 
 ## Running
 
@@ -19,177 +21,88 @@ love .
 
 ## Controls
 
-- **Left Click** - Set destination (creature pathfinds automatically)
-- **Tab** - Switch between creatures (Worm/Blob)
-- **D** - Toggle debug visualization
-- **N** - Toggle navigation graph visualization
-- **S** - Toggle smooth rendering (worm only)
-- **R** - Reset creature position
-- **Escape** - Quit
+| Key | Action |
+|-----|--------|
+| Left click | Guide the selected creature. The click snaps to the surface below; the spider can also go to walls and ceilings. |
+| 1 / 2 / 3, Tab | Select a creature |
+| H | Help card |
+| N | Navigation graph |
+| X | X-ray: creatures drawn as the simulation sees them (points, constraints, bones), over a faint graph |
+| D | Debug view: physics points, foot targets, LoveLibs debug overlay, verbose logs |
+| W | Toggle wandering for unselected creatures |
+| P | Pause |
+| M | Mute |
+| R | Reset |
+| F | Fullscreen |
+| F1–F4 | PostFX: bypass, distortion, bloom, colour grade |
+| Esc | Quit |
+
+## Dev modes (`dev.lua`): verify without a human at the mouse
+
+```bash
+lovec . --selftest        # graph integrity, reachability, 117 trips, determinism, audio smoke test
+lovec . --snap <worm|blob|spider> <sec> <file.png> [--goal x y] [--zoom cx cy z]
+        [--frames n every] [--debug] [--nav] [--help] [--nolight] [--nopost] [--nowander]
+lovec . --bench <sec>     # 1920x1080 uncapped, prints avg/worst frame time
+lovec . --script sitecap/<file>.lua   # capture script (save dir first): offscreen, frame-exact renders
+lovec . --navdump <who> <solid_id>
+lovec . --seed <n>
+```
+
+- Snapshots go to the save dir: `%APPDATA%/LOVE/character/`.
+- The `--script` API (`script_api` in `main.lua`) offers `step(sec)`, `render(w, h, {zoom, hud, xray, show_nav, hide_marker})`, `save` and `click`. Renders are offscreen at any size; PostFX's final `setCanvas()` is redirected into the target.
+- The chaps.dev showcase capture kit lives in the save dir, not the repo: `sitecap/` holds `cap.lua`, `stills.lua`, `cover.lua`, `videos.lua` and `compose_cover.py`.
+- The sim is deterministic: fixed step and seeded `rng.sim`. The selftest proves the same result at 30, 60 and 240 fps.
+- Baseline at the end of v2: 20/20 checks, and about 3.9 ms per frame at 1080p.
 
 ## Architecture
 
-### Core Physics (`core/`)
-
-- **vec2.lua** - 2D vector math library with metamethods
-- **verlet_point.lua** - Position-based physics point (verlet integration)
-- **verlet_chain.lua** - Chain of connected points with distance constraints + Catmull-Rom curve rendering
-- **spring.lua** - Spring-damper force connections (Hooke's law)
-
-### Pathfinding (`core/`)
-
-- **navgraph.lua** - Navigation graph built from level geometry. Creates walk/jump/fall connections between nav points
-- **pathfinder.lua** - A* pathfinding over the nav graph
-- **controller.lua** - Converts paths into movement commands (walk, jump, air_control). Handles waypoint progression
-
-### World (`world/`)
-
-- **platform.lua** - Solid rectangle platforms with collision detection
-- **level.lua** - Collection of platforms forming the test level. Provides `is_point_on_surface()` for grounded detection
-
-### Creatures (`creatures/`)
-
-- **worm.lua** - Verlet chain creature. Head is controlled, body follows with physics
-- **blob.lua** - Spring-based soft body. Center point surrounded by outer points connected with springs
-
-## Key Design Decisions
-
-### Physics
-
-- **Verlet integration** for position-based physics (stable, no velocity explosions)
-- **Gravity**: 980 pixels/sec² (roughly Earth-like)
-- **Terminal velocity**: 600 pixels/sec
-- **Max jump velocity**: 500 vertical, 300 horizontal
-
-### Grounded Detection
-
-The `Level:is_point_on_surface(x, y, tolerance)` function checks if a point is near a walkable surface. This is more reliable than collision-based detection for determining if a creature can jump.
-
-**Important**: Creatures must be within tolerance of a surface to be considered "grounded". The worm's head being "pinned" vs "unpinned" determines whether it uses direct movement (pinned) or physics simulation (unpinned/jumping).
-
-### Movement States
-
-- **Grounded + Pinned**: Direct position control, can walk and jump
-- **Not Grounded + Unpinned**: Physics simulation (gravity, velocity), air control only
-- **Climbing**: Currently disabled (was causing stuck issues)
-
-### Pathfinding
-
-- Nav points placed on ground and platform tops
-- Connections: WALK (horizontal), JUMP (up/across), FALL (down)
-- Wall climbing connections disabled for now
-- Waypoint threshold: 40px (advance to next waypoint when within this distance)
-
-## Known Issues / Future Work
-
-1. **Climbing disabled** - Wall climbing caused creatures to get stuck. Could be re-enabled with better wall detection
-2. **Jump arc** - Jumps use constrained max velocities rather than calculating exact trajectories
-3. **Only 2 creatures** - Plan included FABRIK Spider and Hybrid Slugcat (Rain World style) which aren't implemented yet
-
-## Debug Logging
-
-The worm has debug prints for:
-- `[SPAWN]` - Creature spawn position
-- `[WORM] Jump requested` - When jump command received
-- `[WORM] JUMPING!` - When jump actually fires with velocity
-- `[WORM] Landed!` - When landing detected
-- `[WORM] Walked off edge` - When falling begins
-- `[MAIN]` - Periodic action/movement type logging
-
-## File Structure
-
 ```
-Character/
-├── main.lua              # Entry point, game loop, input handling
-├── conf.lua              # LÖVE configuration
-├── CLAUDE.md             # This file
-├── lib/                  # REUSABLE LIBRARIES (copy to other projects)
-│   ├── vec2.lua          # 2D vector math
-│   ├── verlet.lua        # Verlet physics (points + chains)
-│   ├── spring.lua        # Spring-damper physics
-│   └── synth.lua         # Procedural audio synthesizer
-├── core/                 # Game-specific code
-│   ├── navgraph.lua      # Navigation graph
-│   ├── pathfinder.lua    # A* pathfinding
-│   ├── controller.lua    # Movement controller
-│   └── synth.lua         # Game-specific sound effects
-├── creatures/
-│   ├── worm.lua          # Verlet worm
-│   └── blob.lua          # Spring blob
-└── world/
-    ├── platform.lua      # Platform collision
-    └── level.lua         # Level geometry
+main.lua            fixed-step loop (1/120 s) + render interpolation, input, LoveLibs scaling/postfx/music
+dev.lua             selftest / snap / bench / navdump
+libs/LoveLibs/      git subtree (branch master): scaling, postfx, music, debug overlay, verlet (vines)
+core/
+  ballistics.lua    THE jump model: solve_jump, solve_fall, sample_arc, arc_clear
+  navgraph.lua      per-creature graph: walk/crawl/jump/fall edges, built from that creature's profile
+  pathfinder.lua    A* with a binary heap
+  controller.lua    path -> walk / crawl / launch / steer; repaths on bad landings, stalls, blocks
+  fabrik.lua        2D FABRIK with a pole hint
+  synth.lua         procedural audio: creature voices, movement loops, drips with baked echo, chimes
+  log.lua, rng.lua  category logging (quiet unless D), seeded sim/look RNG streams
+creatures/
+  base.lua          Mover (the exact kinematic anchor) + Face (blink, gaze, eye drawing)
+  worm.lua, blob.lua, spider.lua
+world/
+  levels/cave.lua   solids (AABBs) + decor hints: vines, mushrooms, stalactites, spawns, mouth
+  level.lua         spatial queries: solid_at, raycast, surface_below, top_spans
+  collision.lua     swept point-vs-AABB resolution (entry-time face choice), raycast
+  world.lua         creatures, graphs, controllers, wandering, event bus, interpolation snapshots
+  flora.lua         verlet vines, spring grass, squashable glow mushrooms (all react to creatures)
+  ambience.lua      fireflies, drips, dust motes in the light shafts
+  render/           palette, backdrop (sky + baked back wall), rock (baked stone), lighting, scene
+fx/                 particles (dust, pebbles, spores, splashes), marker (goal ring)
+ui/hud.lua          fading title card, roster, help card
 ```
 
-## Reusable Libraries (`lib/`)
+## Key design decisions
 
-These libraries are designed to be dropped into any LÖVE project:
+- **Anchor plus soft body.** Every creature rides an exact kinematic anchor (`base.lua` Mover). It uses closed-form gravity integration, the same model `ballistics` assumes. The expressive physics (verlet, PBD, IK) hangs off the anchor. Navigation is exact, and the bodies can stay loose.
+- **One jump model.** The navgraph creates a JUMP/FALL edge only if `ballistics.solve_jump` finds a velocity within the creature's limits and `arc_clear` confirms the arc misses all geometry. The controller launches with the same solver. In v1 the graph promised 120px jumps that the controller capped at about 40px.
+- **Per-creature graphs.** They are built from `profile = {radius, height, step, jump_vx, jump_vy, climbs}`. The spider's graph covers every exposed perimeter, corners included, plus concave joins between solids.
+- **Fixed timestep (120 Hz).** Verlet friction and PBD are per step, so physics no longer depends on frame rate. Rendering interpolates between the last two steps through `World:snapshot/interpolate/restore`.
+- **Lighting.** The scene is multiplied by a light map: violet ambient, the mouth pool, the shafts, mushrooms, fireflies, the blob, and a lantern around the selected creature. Emissives and additive shafts are drawn after the multiply. LoveLibs PostFX adds bloom and a colour grade.
+- **Gameplay rewards are visual and audible, never numeric.** Clicks bloom a ring and play a pentatonic chime. Unreachable clicks shrug.
 
-### vec2.lua - 2D Vector Math
-```lua
-local vec2 = require('lib.vec2')
-local a = vec2.new(10, 20)
-local b = vec2.new(5, 5)
-local c = vec2.add(a, b)       -- or a + b with metamethods
-local len = vec2.length(c)
-local norm = vec2.normalize(c)
-```
+## Gotchas learned
 
-### verlet.lua - Verlet Physics
-Position-based physics for ropes, chains, tentacles, and soft bodies.
-```lua
-local Verlet = require('lib.verlet')
+- **PostFX tint:** LoveLibs `PostFX.endScene` draws its canvases with the current colour. Call `setColor(1,1,1,1)` first, or the whole frame is tinted by whatever the scene drew last. It showed up as a dark, green-tinted frame.
+- **Offset outlines fold:** an offset polyline around a sharply bent spine folds into spikes. Draw the outline as a union of discs, and add bending stiffness to the chain.
+- **Level design can trap creatures:** a level can leave pits where nothing is reachable. The selftest's reachability check, "every top surface reachable from spawn and back", caught one immediately.
+- **`ellipse` has no rotation argument:** `love.graphics.ellipse` doesn't rotate. Use push/translate/rotate, as the spider does.
+- **LoveLibs subtree branch:** the LoveLibs subtree is on branch `master`, not `main`.
 
--- Single physics point
-local point = Verlet.Point(100, 200, {mass = 1, friction = 0.99})
-point:update(dt, {x = 0, y = 980})  -- Apply gravity
+## Wishlist
 
--- Chain of connected points (rope/tentacle)
-local chain = Verlet.Chain(100, 50, 10, 15)  -- x, y, segments, segment_length
-chain:update(dt, gravity)
-chain:draw_smooth(4)  -- Draw as smooth curve
-```
-
-### spring.lua - Spring Physics
-Hooke's law spring-damper connections for soft bodies and bouncy physics.
-```lua
-local Spring = require('lib.spring')
-local Verlet = require('lib.verlet')
-
-local p1 = Verlet.Point(100, 100)
-local p2 = Verlet.Point(200, 100)
-local spring = Spring.new(p1, p2, {stiffness = 200, damping = 10})
-
--- In update:
-spring:apply_forces()
-p1:update(dt, gravity)
-p2:update(dt, gravity)
-spring:draw()  -- Color-coded by stretch
-```
-
-### synth.lua - Procedural Audio
-Generate sound effects without audio files.
-```lua
-local Synth = require('lib.synth')
-local synth = Synth.new()
-
--- Use presets
-local jump_sound = synth:create_sound('jump')
-local hit_sound = synth:create_sound('hit')
-jump_sound:play()
-
--- Or generate custom sounds
-local custom = synth:generate({
-    duration = 0.2,
-    frequency = {start = 440, finish = 880},
-    waveform = 'sine',  -- sine, saw, square, triangle, noise
-    envelope = {attack = 0.01, decay = 0.1, sustain = 0.5, release = 0.09},
-    volume = 0.5
-})
-
--- Available presets: jump, land, hit, pickup, coin, laser, explosion, powerup, hurt, blip
-```
-
-## Original Plan
-
-See `C:\Users\chris\.claude\plans\merry-jumping-blanket.md` for the original implementation plan which includes the not-yet-implemented FABRIK Spider and Hybrid Slugcat creatures.
+- The Rain World-style slugcat (verlet body + IK limbs) as a fourth creature.
+- Water pools that the blob floats in, and ripples.
+- Creatures noticing each other: the worm retreats from the spider, the blob follows the worm.
