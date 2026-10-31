@@ -4,6 +4,8 @@ Procedural creature animation in the spirit of Rain World, built with [LÖVE](ht
 
 Three creatures share one overgrown cave at dusk. You guide one with clicks, and the other two wander on their own. None of them is keyframed. Each is a small physics system riding an exact navigation anchor, so they always know where they're going and their bodies stay loose.
 
+**Project page:** [chaps.dev/projects/character](https://chaps.dev/projects/character/) has clips of the spider on the ceiling, the planned leaps, and an x-ray view under the skin.
+
 ![The Dusk Cave](docs/v2-dusk-cave.png)
 
 | Creature | How it moves |
